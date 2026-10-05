@@ -1,0 +1,1074 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ficha Oftalmológica Veterinária - HVA</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+/* ===================== HELPERS ===================== */
+
+function interpretSchirmer(v) {
+  if (!v || isNaN(Number(v))) return "";
+  return Number(v) < 15 ? "Baixa produção lacrimal" : "Normal";
+}
+function interpretPio(v) {
+  if (!v || isNaN(Number(v))) return "";
+  if (Number(v) < 11) return "Hipotonia";
+  if (Number(v) > 25) return "Hipertensão ocular";
+  return "Normal";
+}
+
+/* ===================== TRANSCRIÇÃO DA CONSULTA (via backend pago) ===================== */
+
+const TOPICOS_CONSULTA = [
+  { key: "queixa", label: "Queixa Principal", cor: "amber" },
+  { key: "diagnostico", label: "Diagnóstico", cor: "red" },
+  { key: "tratamento", label: "Tratamento / Prescrição", cor: "green" },
+  { key: "orientacoes", label: "Orientações e Cuidados", cor: "blue" },
+  { key: "outros", label: "Outros Assuntos", cor: "gray" }
+];
+
+function getConfigAPI() {
+  return {
+    backendUrl: localStorage.getItem("hva_backend_url") || "",
+    appSecret: localStorage.getItem("hva_app_secret") || ""
+  };
+}
+
+function ConfiguracaoAPIModal({ isOpen, onClose, onSave }) {
+  const [backendUrl, setBackendUrl] = useState("");
+  const [appSecret, setAppSecret] = useState("");
+
+  useEffect(() => {
+    if (isOpen) {
+      const cfg = getConfigAPI();
+      setBackendUrl(cfg.backendUrl);
+      setAppSecret(cfg.appSecret);
+    }
+  }, [isOpen]);
+
+  if (!isOpen) return null;
+
+  function salvar() {
+    localStorage.setItem("hva_backend_url", backendUrl.trim().replace(/\/$/, ""));
+    localStorage.setItem("hva_app_secret", appSecret.trim());
+    onSave();
+    onClose();
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg" onClick={(e) => e.stopPropagation()}>
+        <div className="p-4 border-b flex items-center justify-between bg-blue-50">
+          <h3 className="font-bold text-lg">⚙️ Configuração da Transcrição</h3>
+          <button className="text-2xl w-8 h-8 rounded hover:bg-gray-100" onClick={onClose}>×</button>
+        </div>
+        <div className="p-4 space-y-3">
+          <p className="text-sm text-gray-600">Preencha uma única vez com os dados do seu backend (veja o README do projeto).</p>
+          <Field label="URL do Backend" value={backendUrl} onChange={setBackendUrl} placeholder="https://seu-backend.vercel.app" />
+          <Field label="Senha do App (APP_SECRET)" value={appSecret} onChange={setAppSecret} placeholder="a mesma senha configurada no Vercel" />
+        </div>
+        <div className="p-4 border-t bg-gray-50 flex gap-3 justify-end">
+          <button className="px-4 py-2 rounded-xl bg-gray-300 text-gray-700 hover:bg-gray-400" onClick={onClose}>Cancelar</button>
+          <button className="px-4 py-2 rounded-xl bg-blue-500 text-white hover:bg-blue-600" onClick={salvar}>Salvar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+async function enviarParaTranscricao(blob, cfg) {
+  const resp = await fetch(`${cfg.backendUrl}/api/transcribe`, {
+    method: "POST",
+    headers: {
+      "Content-Type": blob.type || "audio/webm",
+      "x-app-secret": cfg.appSecret
+    },
+    body: blob
+  });
+  if (!resp.ok) throw new Error(`Transcrição falhou (${resp.status})`);
+  const data = await resp.json();
+  return data.text || "";
+}
+
+async function enviarParaClassificacao(texto, cfg) {
+  const resp = await fetch(`${cfg.backendUrl}/api/classify`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-app-secret": cfg.appSecret
+    },
+    body: JSON.stringify({ text: texto })
+  });
+  if (!resp.ok) throw new Error(`Classificação falhou (${resp.status})`);
+  return await resp.json(); // { topico, resumo }
+}
+
+function TranscricaoConsulta({ onDiagnosticoDetectado, onQueixaDetectada }) {
+  const [gravando, setGravando] = useState(false);
+  const [processando, setProcessando] = useState(false);
+  const [transcricao, setTranscricao] = useState([]); // {texto, topico, hora}
+  const [configModalOpen, setConfigModalOpen] = useState(false);
+  const [erro, setErro] = useState("");
+
+  const mediaRecorderRef = useRef(null);
+  const streamRef = useRef(null);
+  const shouldRecordRef = useRef(false);
+
+  const cfg = getConfigAPI();
+  const configurado = !!(cfg.backendUrl && cfg.appSecret);
+
+  async function processarTrecho(blob) {
+    if (blob.size < 1000) return; // ignora trechos vazios/silêncio muito curto
+    setProcessando(true);
+    try {
+      const cfgAtual = getConfigAPI();
+      const texto = await enviarParaTranscricao(blob, cfgAtual);
+      if (texto && texto.trim()) {
+        const { topico, resumo } = await enviarParaClassificacao(texto.trim(), cfgAtual);
+        const hora = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+        setTranscricao(prev => [...prev, { texto: resumo || texto.trim(), topico, hora }]);
+        if (topico === "diagnostico" && onDiagnosticoDetectado) onDiagnosticoDetectado(resumo || texto.trim());
+        if (topico === "queixa" && onQueixaDetectada) onQueixaDetectada(resumo || texto.trim());
+      }
+      setErro("");
+    } catch (e) {
+      console.error(e);
+      setErro("Falha ao processar um trecho de áudio. Verifique sua conexão e a configuração do backend.");
+    } finally {
+      setProcessando(false);
+    }
+  }
+
+  async function iniciar() {
+    if (!configurado) {
+      setConfigModalOpen(true);
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      shouldRecordRef.current = true;
+
+      function novoCiclo() {
+        if (!shouldRecordRef.current) return;
+        const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+        const localChunks = [];
+        recorder.ondataavailable = (e) => { if (e.data.size > 0) localChunks.push(e.data); };
+        recorder.onstop = () => {
+          const blob = new Blob(localChunks, { type: "audio/webm" });
+          processarTrecho(blob);
+          if (shouldRecordRef.current) novoCiclo();
+        };
+        recorder.start();
+        mediaRecorderRef.current = recorder;
+        // Grava em blocos de 12 segundos e reinicia — permite ir enviando aos poucos
+        setTimeout(() => {
+          if (recorder.state !== "inactive") recorder.stop();
+        }, 12000);
+      }
+
+      novoCiclo();
+      setGravando(true);
+      setErro("");
+    } catch (e) {
+      console.error(e);
+      setErro("Não foi possível acessar o microfone. Verifique as permissões do navegador.");
+    }
+  }
+
+  function parar() {
+    shouldRecordRef.current = false;
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      mediaRecorderRef.current.stop();
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+    }
+    setGravando(false);
+  }
+
+  useEffect(() => () => { shouldRecordRef.current = false; if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop()); }, []);
+
+  function limparTranscricao() {
+    if (window.confirm("Apagar toda a transcrição desta consulta?")) setTranscricao([]);
+  }
+
+  function copiarTranscricaoCompleta() {
+    const texto = TOPICOS_CONSULTA.map(t => {
+      const itens = transcricao.filter(x => x.topico === t.key);
+      if (itens.length === 0) return null;
+      return `${t.label.toUpperCase()}:\n${itens.map(i => `[${i.hora}] ${i.texto}`).join('\n')}`;
+    }).filter(Boolean).join('\n\n');
+    navigator.clipboard.writeText(texto || "Nenhuma transcrição registrada.");
+    alert("Transcrição copiada!");
+  }
+
+  const coresBg = { amber: "bg-amber-50 border-amber-300", red: "bg-red-50 border-red-300", green: "bg-green-50 border-green-300", blue: "bg-blue-50 border-blue-300", gray: "bg-gray-50 border-gray-300" };
+  const coresTexto = { amber: "text-amber-800", red: "text-red-800", green: "text-green-800", blue: "text-blue-800", gray: "text-gray-700" };
+
+  return (
+    <div>
+      <div className="flex items-center gap-3 mb-4 flex-wrap">
+        {!gravando ? (
+          <button className="px-5 py-2 rounded-xl bg-red-500 text-white font-medium hover:bg-red-600 shadow flex items-center gap-2" onClick={iniciar}>
+            🎙️ Iniciar Transcrição da Consulta
+          </button>
+        ) : (
+          <button className="px-5 py-2 rounded-xl bg-red-700 text-white font-medium hover:bg-red-800 shadow flex items-center gap-2 animate-pulse" onClick={parar}>
+            ⏹️ Parar Transcrição
+          </button>
+        )}
+        {transcricao.length > 0 && (
+          <>
+            <button className="px-3 py-2 rounded-xl bg-blue-500 text-white text-sm hover:bg-blue-600" onClick={copiarTranscricaoCompleta}>📄 Copiar Tudo</button>
+            <button className="px-3 py-2 rounded-xl bg-gray-300 text-gray-700 text-sm hover:bg-gray-400" onClick={limparTranscricao}>🗑️ Limpar</button>
+          </>
+        )}
+        <button className="px-3 py-2 rounded-xl bg-gray-100 text-gray-600 text-sm hover:bg-gray-200 ml-auto" onClick={() => setConfigModalOpen(true)}>⚙️ Configurar</button>
+      </div>
+
+      {!configurado && (
+        <p className="text-sm text-amber-700 bg-amber-50 border border-amber-300 rounded-xl p-3 mb-3">
+          Configure o backend antes de usar (botão ⚙️ acima). Veja o README do projeto para o passo a passo.
+        </p>
+      )}
+
+      {erro && <p className="text-sm text-red-700 bg-red-50 border border-red-300 rounded-xl p-3 mb-3">{erro}</p>}
+
+      {gravando && (
+        <div className="mb-3 text-sm text-gray-500 italic px-3">
+          {processando ? "🔄 Processando trecho da conversa..." : "🎙️ Gravando... fale naturalmente com o tutor."}
+        </div>
+      )}
+
+      {transcricao.length === 0 && !gravando && configurado && (
+        <p className="text-sm text-gray-400 px-1">Nenhuma transcrição registrada ainda. Clique em "Iniciar" no começo da consulta.</p>
+      )}
+
+      <div className="space-y-3">
+        {TOPICOS_CONSULTA.map(topico => {
+          const itens = transcricao.filter(x => x.topico === topico.key);
+          if (itens.length === 0) return null;
+          return (
+            <div key={topico.key} className={`rounded-xl border p-3 ${coresBg[topico.cor]}`}>
+              <h4 className={`font-bold text-sm mb-2 ${coresTexto[topico.cor]}`}>{topico.label}</h4>
+              <div className="space-y-1">
+                {itens.map((item, idx) => (
+                  <div key={idx} className="text-sm">
+                    <span className="text-gray-400 text-xs mr-2">[{item.hora}]</span>
+                    <span className="text-gray-800">{item.texto}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {transcricao.length > 0 && (
+        <p className="text-xs text-gray-400 mt-3 px-1">
+          ⚠️ A classificação é feita por IA e pode ocasionalmente errar o tópico — revise antes de confiar 100%. Diagnóstico e queixa detectados são preenchidos nos campos correspondentes, mas continuam totalmente editáveis.
+        </p>
+      )}
+
+      <ConfiguracaoAPIModal isOpen={configModalOpen} onClose={() => setConfigModalOpen(false)} onSave={() => {}} />
+    </div>
+  );
+}
+
+const ESTRUTURAS = [
+  { key: "palpebras", label: "Pálpebras", normal: "sem alterações", explicacao: "Pálpebras protegem os olhos" },
+  { key: "terceiraPalpebra", label: "3ª Pálpebra", normal: "sem alterações", explicacao: "Membrana de proteção adicional" },
+  { key: "conjuntiva", label: "Conjuntiva", normal: "normocorada, sem secreção", explicacao: "Membrana que reveste o olho" },
+  { key: "cornea", label: "Córnea", normal: "transparente, lisa, sem infiltrados", explicacao: "Parte transparente da frente do olho" },
+  { key: "camaraAnterior", label: "Câmara Anterior", normal: "profunda, límpida", explicacao: "Espaço entre a córnea e a íris" },
+  { key: "iris", label: "Íris", normal: "normoconformada", explicacao: "Parte colorida do olho" },
+  { key: "pupila", label: "Pupila", normal: "normorreagente, simétrica", explicacao: "Abertura central que regula a entrada de luz" },
+  { key: "cristalino", label: "Cristalino", normal: "transparente, tópico", explicacao: "Lente natural do olho" },
+  { key: "vitreo", label: "Vítreo", normal: "transparente, sem opacidades", explicacao: "Gel que preenche o interior do olho" },
+  { key: "retina", label: "Retina", normal: "vasos bem definidos, sem hemorragias", explicacao: "Camada sensível à luz no fundo do olho" },
+  { key: "nervoOptico", label: "Nervo Óptico", normal: "normoconformado, sem edema", explicacao: "Transmite sinais visuais ao cérebro" }
+];
+
+const TESTES_CORNEA = [
+  { key: "fluoresceina", label: "Fluoresceína" },
+  { key: "rosaBengala", label: "Rosa Bengala" },
+  { key: "fenilefrina", label: "Fenilefrina" }
+];
+
+const EXAMES_COMPLEMENTARES = [
+  { key: "ultrassom", label: "Ultrassom Ocular", hasPhoto: true },
+  { key: "cultura", label: "Cultura e Antibiograma" },
+  { key: "fotocromatico", label: "Teste Fotocromático" },
+  { key: "erg", label: "ERG (Eletrorretinografia)" },
+  { key: "laboratoriais", label: "Exames Laboratoriais" }
+];
+
+const TRADUCOES_TUTOR = {
+  "normocorada": "com cor saudável",
+  "sem secreção": "limpa, sem secreção",
+  "transparente": "cristalina e transparente",
+  "lisa": "lisa e uniforme",
+  "sem infiltrados": "sem manchas ou lesões",
+  "profunda": "com profundidade normal",
+  "límpida": "límpida e clara",
+  "normoconformada": "com formato normal",
+  "normorreagente": "reagindo normalmente à luz",
+  "simétrica": "simétrica",
+  "tópico": "na posição correta",
+  "sem opacidades": "sem turvações",
+  "vasos bem definidos": "vasos sanguíneos saudáveis",
+  "sem hemorragias": "sem sangramentos",
+  "normoconformado": "com aparência normal",
+  "sem edema": "sem inchaço",
+  "sem alterações": "sem alterações"
+};
+function traduzirTermo(texto) {
+  let t = texto;
+  Object.keys(TRADUCOES_TUTOR).forEach(k => {
+    t = t.replace(new RegExp(k, "gi"), TRADUCOES_TUTOR[k]);
+  });
+  return t;
+}
+
+function fileToDataURL(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => resolve(e.target.result);
+    reader.readAsDataURL(file);
+  });
+}
+
+/* ===================== UI BÁSICOS ===================== */
+
+function Section({ title, children }) {
+  return (
+    <div className="mb-6 bg-white rounded-xl shadow-md p-4">
+      <h2 className="text-lg font-bold text-blue-900 mb-3 border-b pb-2">{title}</h2>
+      {children}
+    </div>
+  );
+}
+
+function Field({ label, value, onChange, placeholder, type = "text" }) {
+  return (
+    <div>
+      {label && <label className="block text-xs font-medium text-gray-600 mb-1">{label}</label>}
+      <input
+        type={type}
+        className="w-full px-3 py-2 rounded-xl border focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+        placeholder={placeholder}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    </div>
+  );
+}
+
+/* Modal genérico de texto (queixa, diagnóstico) */
+function TextModal({ isOpen, onClose, title, value, onSave }) {
+  const [text, setText] = useState("");
+  useEffect(() => { if (isOpen) setText(value || ""); }, [isOpen, value]);
+  if (!isOpen) return null;
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="p-4 border-b flex items-center justify-between bg-blue-50">
+          <h3 className="font-bold text-lg">{title}</h3>
+          <button className="text-2xl w-8 h-8 rounded hover:bg-gray-100" onClick={onClose}>×</button>
+        </div>
+        <div className="p-4">
+          <textarea className="w-full min-h-[250px] px-3 py-2 rounded-xl border focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm" value={text} onChange={(e) => setText(e.target.value)} autoFocus />
+        </div>
+        <div className="p-4 border-t bg-gray-50 flex gap-3 justify-end">
+          <button className="px-4 py-2 rounded-xl bg-gray-300 text-gray-700 hover:bg-gray-400" onClick={onClose}>Cancelar</button>
+          <button className="px-4 py-2 rounded-xl bg-blue-500 text-white hover:bg-blue-600" onClick={() => { onSave(text); onClose(); }}>Salvar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* Modal de estrutura ocular / exame complementar: texto + fotos */
+function ExamModal({ isOpen, onClose, title, value, photos, onSave, allowPhotos }) {
+  const [text, setText] = useState("");
+  const [fotos, setFotos] = useState([]);
+
+  useEffect(() => {
+    if (isOpen) {
+      setText(value || "");
+      setFotos(photos || []);
+    }
+  }, [isOpen, value, photos]);
+
+  if (!isOpen) return null;
+
+  async function handleFiles(e) {
+    const files = Array.from(e.target.files || []);
+    const urls = await Promise.all(files.map(fileToDataURL));
+    setFotos(prev => [...prev, ...urls]);
+  }
+
+  function removeFoto(idx) {
+    setFotos(prev => prev.filter((_, i) => i !== idx));
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="p-4 border-b flex items-center justify-between bg-blue-50 sticky top-0">
+          <h3 className="font-bold text-lg">{title}</h3>
+          <button className="text-2xl w-8 h-8 rounded hover:bg-gray-100" onClick={onClose}>×</button>
+        </div>
+        <div className="p-4">
+          <textarea className="w-full min-h-[150px] px-3 py-2 rounded-xl border focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm" placeholder="Descreva as alterações encontradas (deixe em branco se normal)..." value={text} onChange={(e) => setText(e.target.value)} autoFocus />
+
+          {allowPhotos && (
+            <div className="mt-4">
+              <label className="inline-block px-4 py-2 rounded-xl bg-purple-500 text-white text-sm cursor-pointer hover:bg-purple-600">
+                📷 Anexar Fotos
+                <input type="file" accept="image/*" multiple className="hidden" onChange={handleFiles} />
+              </label>
+              {fotos.length > 0 && (
+                <div className="grid grid-cols-3 gap-2 mt-3">
+                  {fotos.map((f, idx) => (
+                    <div key={idx} className="relative group">
+                      <img src={f} className="w-full h-24 object-cover rounded-lg border" />
+                      <button className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 text-white rounded-lg flex items-center justify-center transition-opacity" onClick={() => removeFoto(idx)}>Remover</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="p-4 border-t bg-gray-50 flex gap-3 justify-end sticky bottom-0">
+          <button className="px-4 py-2 rounded-xl bg-gray-300 text-gray-700 hover:bg-gray-400" onClick={onClose}>Cancelar</button>
+          <button className="px-4 py-2 rounded-xl bg-blue-500 text-white hover:bg-blue-600" onClick={() => { onSave(text, fotos); onClose(); }}>Salvar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* Grade de estruturas oculares (OD ou OE) */
+function OlhoExame({ ladoLabel, exame, setExame, schirmer, setSchirmer, pio, setPio }) {
+  const [modalKey, setModalKey] = useState(null);
+
+  const estruturaAtual = ESTRUTURAS.find(e => e.key === modalKey) || TESTES_CORNEA.find(e => e.key === modalKey);
+
+  return (
+    <div className="bg-blue-50 rounded-xl p-4">
+      <h3 className="font-bold text-blue-900 mb-3">👁️ {ladoLabel}</h3>
+
+      <div className="grid grid-cols-2 gap-3 mb-4">
+        <Field label="Schirmer (mm/min)" value={schirmer} onChange={setSchirmer} placeholder="Ex: 18" />
+        <Field label="PIO (mmHg)" value={pio} onChange={setPio} placeholder="Ex: 15" />
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 mb-3">
+        {ESTRUTURAS.map(est => {
+          const preenchido = exame[est.key] && exame[est.key].trim();
+          const fotos = exame[`${est.key}_photos`] || [];
+          return (
+            <button
+              key={est.key}
+              className={`text-left px-3 py-2 rounded-lg text-sm border ${preenchido ? "bg-red-50 border-red-300" : "bg-white border-gray-200"} hover:bg-blue-100 transition-colors flex items-center justify-between`}
+              onClick={() => setModalKey(est.key)}
+            >
+              <span>{est.label}</span>
+              <span className="flex gap-1">
+                {preenchido && <span className="bg-red-500 text-white text-xs px-1.5 py-0.5 rounded-full">✓</span>}
+                {fotos.length > 0 && <span className="bg-purple-500 text-white text-xs px-1.5 py-0.5 rounded-full">📷{fotos.length}</span>}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="grid grid-cols-3 gap-2">
+        {TESTES_CORNEA.map(t => {
+          const preenchido = exame[t.key] && exame[t.key].trim();
+          return (
+            <button
+              key={t.key}
+              className={`text-left px-2 py-2 rounded-lg text-xs border ${preenchido ? "bg-red-50 border-red-300" : "bg-white border-gray-200"} hover:bg-blue-100`}
+              onClick={() => setModalKey(t.key)}
+            >
+              {t.label} {preenchido && "✓"}
+            </button>
+          );
+        })}
+      </div>
+
+      <ExamModal
+        isOpen={!!modalKey}
+        onClose={() => setModalKey(null)}
+        title={estruturaAtual ? estruturaAtual.label : ""}
+        value={modalKey ? exame[modalKey] : ""}
+        photos={modalKey ? exame[`${modalKey}_photos`] : []}
+        allowPhotos={true}
+        onSave={(text, fotos) => {
+          setExame(prev => ({ ...prev, [modalKey]: text, [`${modalKey}_photos`]: fotos }));
+        }}
+      />
+    </div>
+  );
+}
+
+/* ===================== RECEITUÁRIO ===================== */
+
+function gerarReceita(tipo, medicamentos, patient, location) {
+  const linhas = [];
+  linhas.push("", "", "", "", "", "", "", "");
+  linhas.push("RECEITUÁRIO");
+  linhas.push("");
+  linhas.push(`Data: ${location.data || new Date().toLocaleDateString('pt-BR')}`);
+  linhas.push(`Paciente: ${patient.nome || "_______________________________"}`);
+  linhas.push(`Tutor: ${patient.tutor || "_______________________________"}`);
+  linhas.push("");
+  linhas.push("");
+
+  if (tipo === "oral") linhas.push("USO ORAL:");
+  else if (tipo === "ambos") linhas.push("USO OFTÁLMICO (AMBOS OS OLHOS):");
+  else if (tipo === "od") linhas.push("USO OFTÁLMICO (OLHO DIREITO):");
+  else if (tipo === "oe") linhas.push("USO OFTÁLMICO (OLHO ESQUERDO):");
+  linhas.push("");
+
+  const meds = medicamentos.split('\n').filter(m => m.trim());
+
+  meds.forEach((med, idx) => {
+    let medicamento, frequencia, duracao;
+
+    if (tipo !== "oral") {
+      const percentIndex = med.indexOf('%');
+      if (percentIndex === -1) {
+        linhas.push(`${idx + 1}. ${med.trim()}`);
+        linhas.push("");
+        return;
+      }
+      medicamento = med.substring(0, percentIndex + 1).trim();
+      let resto = med.substring(percentIndex + 1).trim();
+      const partes = resto.split(/[\s,]+/).filter(p => p.trim());
+      frequencia = partes[0] || "conforme orientação";
+      duracao = partes[1] || "uso contínuo";
+    } else {
+      const partes = med.split(',').map(p => p.trim());
+      if (partes.length < 4) {
+        linhas.push(`${idx + 1}. ${med.trim()}`);
+        linhas.push("");
+        return;
+      }
+      medicamento = partes[0];
+      frequencia = partes[2];
+      duracao = partes[3];
+    }
+
+    medicamento = medicamento.charAt(0).toUpperCase() + medicamento.slice(1);
+
+    if (tipo !== "oral" && !medicamento.toLowerCase().includes("colírio")) {
+      const partesMed = medicamento.split(/\s+/);
+      let inserido = false;
+      for (let i = 0; i < partesMed.length; i++) {
+        if (partesMed[i].match(/\d/) && partesMed[i].includes('%')) {
+          partesMed.splice(i, 0, 'colírio');
+          inserido = true;
+          break;
+        }
+      }
+      if (!inserido) partesMed.push('colírio');
+      medicamento = partesMed.join(' ');
+    }
+
+    linhas.push(`${idx + 1}. ${medicamento} _________________________________ ${tipo === "oral" ? "1cx" : "1fco"}`);
+    linhas.push("");
+
+    let instrucao = "";
+    if (tipo === "oral") {
+      const partes = med.split(',').map(p => p.trim());
+      let doseNumero = (partes[1] || "1").replace(/\s*comp(rimidos?)?/gi, '').trim();
+      const doseCapitalizada = doseNumero.charAt(0).toUpperCase() + doseNumero.slice(1);
+      const doseLower = doseNumero.toLowerCase();
+      const textoComprimido = (doseLower.includes("meio") || doseLower === "0,5" || doseLower === "1/2" || doseLower === "1" || doseLower === "um" || doseLower === "uma") ? " comprimido" : " comprimidos";
+      instrucao = `   Dê ${doseCapitalizada}${textoComprimido} por via oral`;
+    } else if (tipo === "od") instrucao = "   Pingue uma gota no olho direito";
+    else if (tipo === "oe") instrucao = "   Pingue uma gota no olho esquerdo";
+    else if (tipo === "ambos") instrucao = "   Pingue uma gota em ambos os olhos";
+
+    const freq = frequencia.toLowerCase().replace(/\s/g, '');
+    let intervalo = "";
+    if (freq.includes("1x") || freq === "sid" || freq === "q24h") intervalo = "a cada 24 horas";
+    else if (freq.includes("2x") || freq === "bid" || freq === "q12h") intervalo = "a cada 12 horas";
+    else if (freq.includes("3x") || freq === "tid" || freq === "q8h") intervalo = "a cada 8 horas";
+    else if (freq.includes("4x") || freq === "qid" || freq === "q6h") intervalo = "a cada 6 horas";
+    else if (freq.includes("5x")) intervalo = "5 vezes ao dia";
+    else if (freq.includes("6x")) intervalo = "6 vezes ao dia";
+    else intervalo = frequencia;
+
+    instrucao += `, ${intervalo}`;
+
+    let duracaoFormatada = duracao;
+    if (duracao.match(/^\d+d$/i)) duracaoFormatada = `${duracao.match(/\d+/)[0]} dias`;
+
+    instrucao += `, por ${duracaoFormatada}.`;
+    linhas.push(instrucao);
+    linhas.push("");
+  });
+
+  linhas.push("");
+  linhas.push("");
+  linhas.push("");
+  linhas.push("_________________________________________________");
+  linhas.push("Dr. Adélio Gurgel do Amaral Jr.");
+  linhas.push("CRMV-SP 18.721");
+  linhas.push("");
+  linhas.push("");
+  linhas.push("OBSERVAÇÕES IMPORTANTES:");
+  linhas.push("");
+  linhas.push("• Uso de colar protetor (elizabetano) é IMPRESCINDÍVEL durante todo o tratamento");
+  linhas.push("• Realizar limpeza ocular com Soro Fisiológico quando observar secreção");
+  linhas.push("• Em caso de piora ou emergência, contatar o HVA: (14) 3626-5287");
+
+  return linhas.join('\n');
+}
+
+function ReceitaModal({ isOpen, onClose, patient, location, tratamentoOD, tratamentoOE, tratamentoOral }) {
+  const [tipoReceita, setTipoReceita] = useState("oral");
+  const [receitaEditavel, setReceitaEditavel] = useState("");
+
+  function getReceitaAtual() {
+    if (tipoReceita === "oral" && tratamentoOral.trim()) return gerarReceita("oral", tratamentoOral, patient, location);
+    if (tipoReceita === "od" && tratamentoOD.trim()) return gerarReceita("od", tratamentoOD, patient, location);
+    if (tipoReceita === "oe" && tratamentoOE.trim()) return gerarReceita("oe", tratamentoOE, patient, location);
+    if (tipoReceita === "ambos") return gerarReceita("ambos", tratamentoOD, patient, location);
+    return "Nenhum tratamento definido para esta opção.";
+  }
+
+  useEffect(() => { if (isOpen) setReceitaEditavel(getReceitaAtual()); }, [isOpen, tipoReceita]);
+
+  if (!isOpen) return null;
+
+  function imprimirReceita() {
+    const w = window.open('', '_blank');
+    w.document.write(`<!DOCTYPE html><html><head><title>Receituário</title><style>@page{size:A4;margin:3cm 2cm 2cm 2cm}body{font-family:'Segoe UI',Arial,sans-serif;font-size:14px;line-height:1.6;color:#333;margin:0;padding:0}pre{font-family:'Segoe UI',Arial,sans-serif;white-space:pre-wrap;word-wrap:break-word;margin:0}</style></head><body><pre>${receitaEditavel}</pre></body></html>`);
+    w.document.close();
+    setTimeout(() => w.print(), 250);
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full h-full flex flex-col" onClick={(e) => e.stopPropagation()}>
+        <div className="p-4 border-b flex items-center justify-between bg-green-50">
+          <h3 className="font-bold text-lg">📋 Receituário</h3>
+          <button className="text-2xl w-8 h-8 rounded hover:bg-gray-100" onClick={onClose}>×</button>
+        </div>
+        <div className="p-4 border-b bg-gray-50 flex gap-3 justify-center flex-wrap">
+          {[["oral", "Oral"], ["od", "OD"], ["oe", "OE"], ["ambos", "Ambos"]].map(([v, l]) => (
+            <button key={v} className={`px-4 py-2 rounded-xl ${tipoReceita === v ? "bg-blue-500 text-white" : "bg-gray-200"}`} onClick={() => setTipoReceita(v)}>{l}</button>
+          ))}
+        </div>
+        <div className="flex-1 overflow-y-auto p-6 bg-gray-50">
+          <textarea className="w-full h-full min-h-full text-sm p-4 rounded-xl border bg-white" value={receitaEditavel} onChange={(e) => setReceitaEditavel(e.target.value)} style={{ fontFamily: "'Segoe UI', Arial, sans-serif", lineHeight: '1.8' }} />
+        </div>
+        <div className="p-4 border-t bg-gray-50 flex gap-3 justify-end">
+          <button className="px-4 py-2 rounded-xl bg-blue-500 text-white hover:bg-blue-600" onClick={() => { navigator.clipboard.writeText(receitaEditavel); alert('Copiado!'); }}>📄 Copiar</button>
+          <button className="px-4 py-2 rounded-xl bg-green-500 text-white hover:bg-green-600" onClick={imprimirReceita}>🖨 Imprimir</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ===================== RELATÓRIOS ===================== */
+
+function gerarRelatorioTutorHTML(patient, location, examsOD, examsOE, diagnostico) {
+  let html = `
+    <div style="font-family:'Segoe UI',Arial,sans-serif;max-width:900px;margin:0 auto;padding:20px;color:#333;">
+      <div style="text-align:center;margin-bottom:30px;border-bottom:3px solid #2563eb;padding-bottom:20px;">
+        <h1 style="color:#1e40af;margin:0;font-size:26px;">Relatório do Exame Oftalmológico</h1>
+        <p style="color:#64748b;margin:10px 0 0 0;">Serviço de Oftalmologia Veterinária - HVA</p>
+      </div>
+      <div style="background:#f8fafc;padding:20px;border-radius:12px;margin-bottom:25px;">
+        <h2 style="color:#1e40af;font-size:18px;margin:0 0 15px 0;">📋 Informações do Paciente</h2>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+          <div><strong>Paciente:</strong> ${patient.nome || '_'}</div>
+          <div><strong>Data:</strong> ${location.data || new Date().toLocaleDateString('pt-BR')}</div>
+          <div><strong>Espécie/Raça:</strong> ${patient.especie || '_'} / ${patient.raca || '_'}</div>
+          <div><strong>Idade:</strong> ${patient.idade || '_'}</div>
+          <div style="grid-column:1/-1;"><strong>Tutor(a):</strong> ${patient.tutor || '_'}</div>
+        </div>
+      </div>
+      <div style="background:#fef3c7;border-left:4px solid #f59e0b;padding:15px;border-radius:8px;margin-bottom:20px;">
+        <p style="margin:0;color:#92400e;"><strong>Nota:</strong> Este relatório usa linguagem simples. Detalhes técnicos estão no prontuário médico.</p>
+      </div>
+  `;
+
+  function blocoOlho(label, exame, schirmer, pio) {
+    let h = `<div style="background:white;border:2px solid #dbeafe;border-radius:12px;padding:20px;margin-bottom:20px;">
+      <h3 style="color:#2563eb;font-size:18px;margin:0 0 15px 0;">👁️ ${label}</h3>`;
+
+    if (schirmer || pio) {
+      h += `<div style="margin-bottom:15px;"><strong>Testes Realizados:</strong></div>`;
+      if (schirmer) {
+        const r = interpretSchirmer(schirmer);
+        const cor = r === 'Normal' ? '#10b981' : '#ef4444';
+        h += `<div style="padding:10px;background:#f0f9ff;border-radius:6px;margin-bottom:8px;">
+          <strong>Teste de Lágrima (Schirmer):</strong> ${schirmer} mm/min
+          <span style="color:${cor};font-weight:bold;"> - ${r === 'Normal' ? '✓ Normal' : '⚠ ' + r}</span>
+        </div>`;
+      }
+      if (pio) {
+        const r = interpretPio(pio);
+        const cor = r === 'Normal' ? '#10b981' : '#ef4444';
+        h += `<div style="padding:10px;background:#f0f9ff;border-radius:6px;margin-bottom:8px;">
+          <strong>Pressão Ocular:</strong> ${pio} mmHg
+          <span style="color:${cor};font-weight:bold;"> - ${r === 'Normal' ? '✓ Normal' : '⚠ ' + r}</span>
+        </div>`;
+      }
+    }
+
+    h += `<div style="margin-top:15px;"><strong>Estruturas Examinadas:</strong></div>`;
+    ESTRUTURAS.forEach(est => {
+      const valor = exame[est.key];
+      const temAlteracao = valor && valor.trim();
+      const texto = traduzirTermo(temAlteracao ? valor : est.normal);
+      const cor = temAlteracao ? '#dc2626' : '#10b981';
+      const icone = temAlteracao ? '⚠️' : '✓';
+      h += `<div style="padding:10px;background:${temAlteracao ? '#fef2f2' : '#f0fdf4'};border-radius:6px;margin:8px 0;border-left:3px solid ${cor};">
+        <strong style="color:${cor};">${icone} ${est.label}${temAlteracao ? '' : ''}:</strong> ${texto}
+        <br><small style="color:#64748b;">${est.explicacao}</small>
+      </div>`;
+      const fotos = exame[`${est.key}_photos`] || [];
+      if (fotos.length > 0) {
+        h += `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin:10px 0 10px 20px;">`;
+        fotos.forEach((f, i) => { h += `<img src="${f}" style="width:100%;border-radius:8px;border:2px solid #e5e7eb;" alt="Foto ${i+1}"/>`; });
+        h += `</div>`;
+      }
+    });
+
+    h += `</div>`;
+    return h;
+  }
+
+  html += blocoOlho("Olho Direito (OD)", examsOD, examsOD.schirmer, examsOD.pio);
+  html += blocoOlho("Olho Esquerdo (OE)", examsOE, examsOE.schirmer, examsOE.pio);
+
+  html += `
+      <div style="background:#eff6ff;border:2px solid #3b82f6;border-radius:12px;padding:20px;margin:25px 0;">
+        <h3 style="color:#1e40af;font-size:18px;margin:0 0 15px 0;">💡 Conclusão e Orientações</h3>
+        <p style="line-height:1.8;margin:0;">${diagnostico.trim() || 'O exame oftalmológico está dentro dos padrões de normalidade. Não foram identificadas alterações que necessitem tratamento no momento.'}</p>
+      </div>
+      <div style="margin-top:30px;padding-top:20px;border-top:2px solid #e5e7eb;text-align:center;color:#64748b;">
+        <p style="margin:5px 0;"><strong>Dr. Adélio Gurgel do Amaral Jr.</strong></p>
+        <p style="margin:5px 0;">CRMV-SP 18.721</p>
+        <p style="margin:5px 0;">Serviço de Oftalmologia Veterinária - HVA</p>
+        <p style="margin:15px 0 5px 0;font-size:14px;">Dúvidas? Entre em contato: (14) 3626-5287</p>
+      </div>
+    </div>
+  `;
+  return html;
+}
+
+function gerarRelatorioProntuario(patient, location, examsOD, examsOE, examesComplementares, diagnostico) {
+  const linhas = [];
+  linhas.push("RELATÓRIO - PRONTUÁRIO MÉDICO");
+  linhas.push("");
+  linhas.push(`Data: ${location.data || new Date().toLocaleDateString('pt-BR')}`);
+  linhas.push(`Paciente: ${patient.nome || "_"}  |  Espécie/Raça: ${patient.especie || "_"}/${patient.raca || "_"}  |  Idade: ${patient.idade || "_"}`);
+  linhas.push(`Tutor: ${patient.tutor || "_"}`);
+  linhas.push("");
+  linhas.push("ALTERAÇÕES ENCONTRADAS:");
+  linhas.push("");
+
+  let temAlteracao = false;
+
+  function listarAlteracoes(label, exame, schirmer, pio) {
+    let bloco = [];
+    if (schirmer) {
+      const r = interpretSchirmer(schirmer);
+      if (r !== "Normal") bloco.push(`- Schirmer: ${schirmer} mm/min (${r})`);
+    }
+    if (pio) {
+      const r = interpretPio(pio);
+      if (r !== "Normal") bloco.push(`- PIO: ${pio} mmHg (${r})`);
+    }
+    ESTRUTURAS.forEach(est => {
+      const v = exame[est.key];
+      if (v && v.trim()) bloco.push(`- ${est.label}: ${v.trim()}`);
+    });
+    TESTES_CORNEA.forEach(t => {
+      const v = exame[t.key];
+      if (v && v.trim()) bloco.push(`- ${t.label}: ${v.trim()}`);
+    });
+    if (bloco.length > 0) {
+      temAlteracao = true;
+      linhas.push(`${label}:`);
+      linhas.push(...bloco);
+      linhas.push("");
+    }
+  }
+
+  listarAlteracoes("OD", examsOD, examsOD.schirmer, examsOD.pio);
+  listarAlteracoes("OE", examsOE, examsOE.schirmer, examsOE.pio);
+
+  EXAMES_COMPLEMENTARES.forEach(ex => {
+    const v = examesComplementares[ex.key];
+    if (v && v.trim()) {
+      temAlteracao = true;
+      linhas.push(`${ex.label}: ${v.trim()}`);
+      linhas.push("");
+    }
+  });
+
+  if (!temAlteracao) {
+    linhas.push("Nenhuma alteração encontrada.");
+    linhas.push("");
+  }
+
+  linhas.push("DIAGNÓSTICO:");
+  linhas.push(diagnostico.trim() || "_");
+  linhas.push("");
+  linhas.push("_________________________________________________");
+  linhas.push("Dr. Adélio Gurgel do Amaral Jr. - CRMV-SP 18.721");
+
+  return linhas.join('\n');
+}
+
+function RelatorioModal({ isOpen, onClose, title, content, isHTML }) {
+  const [texto, setTexto] = useState("");
+  useEffect(() => { if (isOpen) setTexto(content); }, [isOpen, content]);
+  if (!isOpen) return null;
+
+  function copiar() {
+    if (isHTML) {
+      const temp = document.createElement('div');
+      temp.innerHTML = texto;
+      navigator.clipboard.writeText(temp.textContent || temp.innerText);
+    } else {
+      navigator.clipboard.writeText(texto);
+    }
+    alert('Copiado!');
+  }
+
+  function imprimir() {
+    const w = window.open('', '_blank');
+    if (isHTML) {
+      w.document.write(`<!DOCTYPE html><html><head><title>${title}</title><style>@page{size:A4;margin:2cm}body{margin:0;padding:0}</style></head><body>${texto}</body></html>`);
+    } else {
+      w.document.write(`<!DOCTYPE html><html><head><title>${title}</title><style>@page{size:A4;margin:2cm}body{font-family:'Segoe UI',Arial,sans-serif;font-size:12px;line-height:1.8;color:#333;margin:0;padding:0}pre{white-space:pre-wrap;word-wrap:break-word;font-family:inherit;margin:0}</style></head><body><pre>${texto}</pre></body></html>`);
+    }
+    w.document.close();
+    setTimeout(() => w.print(), 250);
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full h-full flex flex-col" onClick={(e) => e.stopPropagation()}>
+        <div className="p-4 border-b flex items-center justify-between bg-blue-50">
+          <h3 className="font-bold text-lg">{title}</h3>
+          <button className="text-2xl w-8 h-8 rounded hover:bg-gray-100" onClick={onClose}>×</button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-6 bg-gray-50">
+          {isHTML ? (
+            <div className="bg-white p-6 rounded-xl shadow-sm" dangerouslySetInnerHTML={{ __html: texto }} />
+          ) : (
+            <textarea className="w-full h-full min-h-full text-sm p-4 rounded-xl border bg-white" value={texto} onChange={(e) => setTexto(e.target.value)} style={{ fontFamily: "'Segoe UI', Arial, sans-serif", lineHeight: '1.8' }} />
+          )}
+        </div>
+        <div className="p-4 border-t bg-gray-50 flex gap-3 justify-end">
+          <button className="px-4 py-2 rounded-xl bg-blue-500 text-white hover:bg-blue-600" onClick={copiar}>📄 Copiar</button>
+          <button className="px-4 py-2 rounded-xl bg-green-500 text-white hover:bg-green-600" onClick={imprimir}>🖨 Imprimir</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ===================== EXAMES COMPLEMENTARES ===================== */
+
+function ExamesComplementares({ dados, setDados }) {
+  const [modalKey, setModalKey] = useState(null);
+  const atual = EXAMES_COMPLEMENTARES.find(e => e.key === modalKey);
+
+  return (
+    <div className="grid grid-cols-2 gap-2">
+      {EXAMES_COMPLEMENTARES.map(ex => {
+        const preenchido = dados[ex.key] && dados[ex.key].trim();
+        const fotos = dados[`${ex.key}_photos`] || [];
+        return (
+          <button
+            key={ex.key}
+            className={`text-left px-3 py-2 rounded-lg text-sm border ${preenchido ? "bg-blue-50 border-blue-300" : "bg-white border-gray-200"} hover:bg-blue-100 flex items-center justify-between`}
+            onClick={() => setModalKey(ex.key)}
+          >
+            <span>{ex.label}</span>
+            <span className="flex gap-1">
+              {preenchido && <span className="bg-blue-500 text-white text-xs px-1.5 py-0.5 rounded-full">✓</span>}
+              {fotos.length > 0 && <span className="bg-purple-500 text-white text-xs px-1.5 py-0.5 rounded-full">📷{fotos.length}</span>}
+            </span>
+          </button>
+        );
+      })}
+      <ExamModal
+        isOpen={!!modalKey}
+        onClose={() => setModalKey(null)}
+        title={atual ? atual.label : ""}
+        value={modalKey ? dados[modalKey] : ""}
+        photos={modalKey ? dados[`${modalKey}_photos`] : []}
+        allowPhotos={atual ? !!atual.hasPhoto : false}
+        onSave={(text, fotos) => {
+          setDados(prev => ({ ...prev, [modalKey]: text, [`${modalKey}_photos`]: fotos }));
+        }}
+      />
+    </div>
+  );
+}
+
+/* ===================== APP PRINCIPAL ===================== */
+
+function OphthoVetApp() {
+  const [patient, setPatient] = useState({ nome: '', especie: '', raca: '', sexo: '', idade: '', tutor: '' });
+  const [location, setLocation] = useState({ data: '', tipoConsulta: '' });
+  const [chiefComplaint, setChiefComplaint] = useState("");
+  const [queixaModalOpen, setQueixaModalOpen] = useState(false);
+
+  const [examsOD, setExamsOD] = useState({});
+  const [examsOE, setExamsOE] = useState({});
+
+  const [examesComplementares, setExamesComplementares] = useState({});
+
+  const [tratamentoOral, setTratamentoOral] = useState("");
+  const [tratamentoOD, setTratamentoOD] = useState("");
+  const [tratamentoOE, setTratamentoOE] = useState("");
+
+  const [diagnostico, setDiagnostico] = useState("");
+  const [diagnosticoModalOpen, setDiagnosticoModalOpen] = useState(false);
+
+  const [receitaModalOpen, setReceitaModalOpen] = useState(false);
+  const [relatorioTutorOpen, setRelatorioTutorOpen] = useState(false);
+  const [relatorioProntuarioOpen, setRelatorioProntuarioOpen] = useState(false);
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
+      <div className="max-w-6xl mx-auto bg-white rounded-2xl shadow-xl p-6">
+
+        <div className="flex items-start justify-between mb-6 flex-wrap gap-2">
+          <h1 className="text-xl md:text-2xl font-bold text-blue-900">Serviço de Oftalmologia Veterinária - HVA</h1>
+          <div className="text-right text-sm">
+            <div className="italic text-gray-700">Dr. Adélio Gurgel do Amaral Jr.</div>
+            <div className="italic text-gray-600 text-xs">CRMV-SP 18.721</div>
+          </div>
+        </div>
+
+        <Section title="Identificação do Paciente">
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+            <Field label="Nome do Paciente" value={patient.nome} onChange={(v) => setPatient(p => ({ ...p, nome: v }))} />
+            <Field label="Tutor" value={patient.tutor} onChange={(v) => setPatient(p => ({ ...p, tutor: v }))} />
+            <Field label="Espécie" value={patient.especie} onChange={(v) => setPatient(p => ({ ...p, especie: v }))} />
+            <Field label="Raça" value={patient.raca} onChange={(v) => setPatient(p => ({ ...p, raca: v }))} />
+            <Field label="Sexo" value={patient.sexo} onChange={(v) => setPatient(p => ({ ...p, sexo: v }))} />
+            <Field label="Idade" value={patient.idade} onChange={(v) => setPatient(p => ({ ...p, idade: v }))} />
+            <Field label="Data" type="date" value={location.data} onChange={(v) => setLocation(p => ({ ...p, data: v }))} />
+            <Field label="Tipo de Consulta" value={location.tipoConsulta} onChange={(v) => setLocation(p => ({ ...p, tipoConsulta: v }))} placeholder="Consulta, Retorno..." />
+          </div>
+        </Section>
+
+        <Section title="🎙️ Transcrição da Consulta">
+          <TranscricaoConsulta
+            onDiagnosticoDetectado={(texto) => setDiagnostico(prev => prev ? `${prev}\n${texto}` : texto)}
+            onQueixaDetectada={(texto) => setChiefComplaint(prev => prev ? `${prev}\n${texto}` : texto)}
+          />
+        </Section>
+
+        <Section title="Queixa Principal">
+          <div className="w-full px-3 py-3 rounded-xl border bg-white cursor-pointer hover:bg-blue-50 min-h-[70px] flex items-center" onClick={() => setQueixaModalOpen(true)}>
+            {chiefComplaint ? <p className="text-sm whitespace-pre-wrap">{chiefComplaint}</p> : <p className="text-sm text-gray-400">Clique para adicionar a queixa principal...</p>}
+          </div>
+        </Section>
+
+        <Section title="Exame Oftalmológico">
+          <div className="grid md:grid-cols-2 gap-4">
+            <OlhoExame ladoLabel="Olho Direito (OD)" exame={examsOD} setExame={setExamsOD}
+              schirmer={examsOD.schirmer || ""} setSchirmer={(v) => setExamsOD(p => ({ ...p, schirmer: v }))}
+              pio={examsOD.pio || ""} setPio={(v) => setExamsOD(p => ({ ...p, pio: v }))} />
+            <OlhoExame ladoLabel="Olho Esquerdo (OE)" exame={examsOE} setExame={setExamsOE}
+              schirmer={examsOE.schirmer || ""} setSchirmer={(v) => setExamsOE(p => ({ ...p, schirmer: v }))}
+              pio={examsOE.pio || ""} setPio={(v) => setExamsOE(p => ({ ...p, pio: v }))} />
+          </div>
+        </Section>
+
+        <Section title="Exames Complementares">
+          <ExamesComplementares dados={examesComplementares} setDados={setExamesComplementares} />
+        </Section>
+
+        <Section title="Tratamento">
+          <div className="space-y-3">
+            <div>
+              <label className="block text-sm font-medium mb-1">Tratamento Oral</label>
+              <textarea className="w-full px-3 py-2 rounded-xl border text-sm" rows="2" placeholder="Ex: Cefalexina comp 500mg, 1, bid, 10d" value={tratamentoOral} onChange={(e) => setTratamentoOral(e.target.value)} />
+              <small className="text-gray-500 block mt-1">medicamento, quantidade, frequência, duração</small>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Tratamento OD</label>
+              <textarea className="w-full px-3 py-2 rounded-xl border text-sm" rows="2" placeholder="Ex: Tobramicina 0,3% bid 10d" value={tratamentoOD} onChange={(e) => setTratamentoOD(e.target.value)} />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Tratamento OE</label>
+              <textarea className="w-full px-3 py-2 rounded-xl border text-sm" rows="2" placeholder="Ex: Tobramicina 0,3% bid 10d" value={tratamentoOE} onChange={(e) => setTratamentoOE(e.target.value)} />
+              <small className="text-gray-500 block mt-1">medicamento concentração% frequência duração</small>
+            </div>
+          </div>
+        </Section>
+
+        <Section title="Diagnóstico">
+          <div className="w-full px-3 py-3 rounded-xl border bg-white cursor-pointer hover:bg-blue-50 min-h-[70px] flex items-center" onClick={() => setDiagnosticoModalOpen(true)}>
+            {diagnostico ? <p className="text-sm whitespace-pre-wrap">{diagnostico}</p> : <p className="text-sm text-gray-400">Clique para adicionar o diagnóstico...</p>}
+          </div>
+        </Section>
+
+        <div className="flex flex-wrap gap-3 justify-center pt-2">
+          <button className="px-5 py-3 rounded-xl bg-green-600 text-white font-medium hover:bg-green-700 shadow-lg" onClick={() => setReceitaModalOpen(true)}>📋 Gerar Receituário</button>
+          <button className="px-5 py-3 rounded-xl bg-blue-600 text-white font-medium hover:bg-blue-700 shadow-lg" onClick={() => setRelatorioTutorOpen(true)}>📄 Relatório Tutor</button>
+          <button className="px-5 py-3 rounded-xl bg-indigo-700 text-white font-medium hover:bg-indigo-800 shadow-lg" onClick={() => setRelatorioProntuarioOpen(true)}>📋 Relatório Prontuário</button>
+        </div>
+      </div>
+
+      <TextModal isOpen={queixaModalOpen} onClose={() => setQueixaModalOpen(false)} title="Queixa Principal" value={chiefComplaint} onSave={setChiefComplaint} />
+      <TextModal isOpen={diagnosticoModalOpen} onClose={() => setDiagnosticoModalOpen(false)} title="Diagnóstico" value={diagnostico} onSave={setDiagnostico} />
+
+      <ReceitaModal isOpen={receitaModalOpen} onClose={() => setReceitaModalOpen(false)} patient={patient} location={location} tratamentoOD={tratamentoOD} tratamentoOE={tratamentoOE} tratamentoOral={tratamentoOral} />
+
+      <RelatorioModal
+        isOpen={relatorioTutorOpen}
+        onClose={() => setRelatorioTutorOpen(false)}
+        title="📄 Relatório para o Tutor"
+        content={gerarRelatorioTutorHTML(patient, location, examsOD, examsOE, diagnostico)}
+        isHTML={true}
+      />
+
+      <RelatorioModal
+        isOpen={relatorioProntuarioOpen}
+        onClose={() => setRelatorioProntuarioOpen(false)}
+        title="📋 Relatório para Prontuário Médico"
+        content={gerarRelatorioProntuario(patient, location, examsOD, examsOE, examesComplementares, diagnostico)}
+        isHTML={false}
+      />
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<OphthoVetApp />);
+</script>
+</body>
+</html>
